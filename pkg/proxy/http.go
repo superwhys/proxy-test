@@ -24,6 +24,8 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		r.URL.Host = r.Host
 	}
 
+	modifyHeader(r)
+
 	resp, err := p.transport.RoundTrip(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)

@@ -27,6 +27,8 @@ var (
 
 	hostRules = []string{
 		"baidu.com",
+		"superwhys.top",
+		"httpbin.org",
 	}
 )
 
@@ -86,9 +88,6 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Access Denied", http.StatusForbidden)
 		return
 	}
-
-	r.Header.Set("X-Proxy-Modified", "true")
-	r.Header.Set("X-Custom-Header", "modified-by-proxy")
 
 	p.handleHTTP(w, r)
 }

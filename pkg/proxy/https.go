@@ -1,13 +1,13 @@
 package proxy
 
 import (
+	"bufio"
 	"crypto/tls"
 	"io"
 	"net/http"
 	"time"
 
 	"github.com/go-puzzles/puzzles/plog"
-	"golang.org/x/sync/errgroup"
 )
 
 func (p *ProxyHandler) shouldBlockHTTPS(host string) bool {
@@ -53,28 +53,28 @@ func (p *ProxyHandler) handleHTTPS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetConn, err := tls.Dial("tcp", r.Host, &tls.Config{
-		InsecureSkipVerify: true,
-	})
-	if err != nil {
-		plog.Errorf("Connect to target server failed: %v", err)
-		return
-	}
-	defer targetConn.Close()
+	reader := bufio.NewReader(tlsConn)
+	for {
+		req, err := http.ReadRequest(reader)
+		if err != nil {
+			if err != io.EOF {
+				plog.Errorf("Failed to read request: %v", err)
+			}
+			return
+		}
 
-	plog.Infof("Forwarding request to %s", r.URL.String())
+		req.URL.Scheme = "https"
+		req.URL.Host = r.Host
 
-	wg := &errgroup.Group{}
-	wg.Go(func() error {
-		_, err := io.Copy(targetConn, tlsConn)
-		return err
-	})
-	wg.Go(func() error {
-		_, err := io.Copy(tlsConn, targetConn)
-		return err
-	})
+		modifyHeader(req)
 
-	if err := wg.Wait(); err != nil {
-		plog.Errorf("Copy failed: %v", err)
+		resp, err := p.transport.RoundTrip(req)
+		if err != nil {
+			plog.Errorf("Failed to forward request: %v", err)
+			return
+		}
+
+		resp.Write(tlsConn)
+		resp.Body.Close()
 	}
 }
