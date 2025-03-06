@@ -1,36 +1,49 @@
 package proxy
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"io"
+	"crypto/x509/pkix"
+	"math/big"
+	"net"
 	"net/http"
 	"regexp"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-puzzles/puzzles/plog"
 	"github.com/pkg/errors"
 	"github.com/superwhys/haowen/golang/proxy-test/pkg/ca"
 )
 
+var (
+	blockHTTPSPatterns = []string{
+		"github.com",
+	}
+
+	hostRules = []string{
+		"baidu.com",
+	}
+)
+
 type ProxyHandler struct {
-	forwardRules    []string
-	modifyRules     []string
+	hostRules       []string
 	blockHTTPSRules []*regexp.Regexp
 	transport       *http.Transport
 	caCert          *x509.Certificate
 	caKey           *rsa.PrivateKey
-	certCache       sync.Map
+	certCache       map[string]*tls.Certificate
+	certCacheMutex  sync.RWMutex
 }
 
-func NewProxyHandler(caCert *x509.Certificate, caKey *rsa.PrivateKey) (*ProxyHandler, error) {
-
-	blockHTTPSPatterns := []string{
-		`^example\.com$`,
-		`.*\.example\.com$`,
-		`^(.*\.)?example\.[^.]+$`,
+func NewProxyHandler() (*ProxyHandler, error) {
+	caCert, caKey, err := ca.LoadCA()
+	if err != nil {
+		return nil, errors.Wrap(err, "load CA failed")
 	}
 
 	blockHTTPSRules := make([]*regexp.Regexp, 0, len(blockHTTPSPatterns))
@@ -43,14 +56,15 @@ func NewProxyHandler(caCert *x509.Certificate, caKey *rsa.PrivateKey) (*ProxyHan
 	}
 
 	return &ProxyHandler{
-		forwardRules:    []string{"superwhys.com"},
-		modifyRules:     []string{"superwhys.top"},
+		hostRules:       hostRules,
 		blockHTTPSRules: blockHTTPSRules,
 		transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
 		},
-		caCert: caCert,
-		caKey:  caKey,
+		caCert:         caCert,
+		caKey:          caKey,
+		certCache:      make(map[string]*tls.Certificate),
+		certCacheMutex: sync.RWMutex{},
 	}, nil
 }
 
@@ -67,129 +81,87 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	host := r.Host
 
-	if p.shouldModifyHeaders(host) {
-		r.Header.Set("X-Proxy-Modified", "true")
-		r.Header.Set("X-Custom-Header", "modified-by-proxy")
-	}
-
-	if p.shouldForward(host) {
-		p.forwardRequest(w, r)
+	if !p.shouldProcessRequest(host) {
+		plog.Infof("Reject request: %s", r.Host)
+		http.Error(w, "Access Denied", http.StatusForbidden)
 		return
 	}
 
-	p.forwardRequest(w, r)
+	r.Header.Set("X-Proxy-Modified", "true")
+	r.Header.Set("X-Custom-Header", "modified-by-proxy")
+
+	p.handleHTTP(w, r)
 }
 
-func (p *ProxyHandler) handleHTTPS(w http.ResponseWriter, r *http.Request) {
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		return
+func (p *ProxyHandler) createCert(host string) (*tls.Certificate, error) {
+	p.certCacheMutex.RLock()
+	if cert, ok := p.certCache[host]; ok {
+		p.certCacheMutex.RUnlock()
+		return cert, nil
 	}
+	p.certCacheMutex.RUnlock()
 
-	clientConn, _, err := hijacker.Hijack()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
+		return nil, errors.Wrap(err, "generate private key failed")
 	}
 
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	cert, err := p.getCertificate(r.Host)
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		plog.Errorf("Get certificate failed: %v", err)
-		clientConn.Close()
-		return
+		return nil, errors.Wrap(err, "generate serial number failed")
 	}
 
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{*cert},
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName:   host,
+			Organization: []string{"Proxy CA"},
+		},
+		NotBefore:             time.Now().Add(-10 * time.Minute),
+		NotAfter:              time.Now().AddDate(1, 0, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{host},
 	}
-	tlsConn := tls.Server(clientConn, tlsConfig)
-	defer tlsConn.Close()
 
-	if err := tlsConn.Handshake(); err != nil {
-		plog.Errorf("TLS handshake failed: %v", err)
-		return
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		template.DNSNames = []string{h}
+		if ip := net.ParseIP(h); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		}
+	} else {
+		if ip := net.ParseIP(host); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		}
 	}
 
-	targetConn, err := tls.Dial("tcp", r.Host, &tls.Config{
-		InsecureSkipVerify: true,
-	})
+	certDER, err := x509.CreateCertificate(rand.Reader, template, p.caCert, &priv.PublicKey, p.caKey)
 	if err != nil {
-		plog.Errorf("Connect to target server failed: %v", err)
-		return
-	}
-	defer targetConn.Close()
-
-	go io.Copy(targetConn, tlsConn)
-	io.Copy(tlsConn, targetConn)
-}
-
-func (p *ProxyHandler) getCertificate(host string) (*tls.Certificate, error) {
-	if cert, ok := p.certCache.Load(host); ok {
-		return cert.(*tls.Certificate), nil
+		return nil, errors.Wrap(err, "create certificate failed")
 	}
 
-	cert, err := ca.GenerateCert(host, p.caCert, p.caKey)
-	if err != nil {
-		return nil, err
+	cert := &tls.Certificate{
+		Certificate: [][]byte{certDER, p.caCert.Raw},
+		PrivateKey:  priv,
+		Leaf:        template,
 	}
 
-	p.certCache.Store(host, cert)
+	p.certCacheMutex.Lock()
+	p.certCache[host] = cert
+	p.certCacheMutex.Unlock()
+
 	return cert, nil
 }
 
-func (p *ProxyHandler) shouldModifyHeaders(host string) bool {
-	for _, rule := range p.modifyRules {
-		if strings.Contains(host, rule) {
-			return true
-		}
-	}
-	return false
-}
-
-func (p *ProxyHandler) shouldForward(host string) bool {
-	for _, rule := range p.forwardRules {
-		if strings.Contains(host, rule) {
-			return true
-		}
-	}
-	return false
-}
-
-func (p *ProxyHandler) shouldBlockHTTPS(host string) bool {
-	for _, rule := range p.blockHTTPSRules {
-		if rule.MatchString(host) {
-			plog.Infof("HTTPS domain %s is blocked by rule %s", host, rule.String())
-			return true
-		}
-	}
-	return false
-}
-
-func (p *ProxyHandler) forwardRequest(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Scheme == "" {
-		r.URL.Scheme = "http"
-		r.URL.Host = r.Host
-	}
-
-	resp, err := p.transport.RoundTrip(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	defer resp.Body.Close()
-
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-
-	plog.Infof("Forwarding request to %s", r.URL.String())
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		plog.Errorf("Error copying response body: %v", err)
+func (p *ProxyHandler) mitmTLSConfig() *tls.Config {
+	return &tls.Config{
+		GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			host := info.ServerName
+			if host == "" {
+				host = "unknown"
+			}
+			return p.createCert(host)
+		},
 	}
 }

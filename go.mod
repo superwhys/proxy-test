@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/go-puzzles/puzzles v1.1.50
 	github.com/pkg/errors v0.9.1
+	golang.org/x/sync v0.11.0
 )
 
 require (
